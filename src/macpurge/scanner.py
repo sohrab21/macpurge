@@ -91,10 +91,15 @@ def scan_category(category: PathCategory) -> ScanResult:
                     total_bytes += size
                     file_count += 1
     elif category.key == "docker":
-        # Single file — just stat it
+        # Single file — use st_blocks for sparse file (APFS) actual disk usage
         for p in category.paths:
             if p.exists():
-                size = file_size_safe(p)
+                try:
+                    st = p.stat()
+                    # st_blocks is in 512-byte units; gives actual disk usage for sparse files
+                    size = st.st_blocks * 512
+                except OSError:
+                    size = 0
                 if size > 0:
                     paths_found.append((p, size))
                     total_bytes += size

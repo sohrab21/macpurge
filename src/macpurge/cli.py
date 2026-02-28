@@ -113,7 +113,7 @@ def _cmd_scan():
         print(f"{left:<30} {right:>10}")
 
     print("─" * 40)
-    total = sum(r.total_bytes for r in results)
+    total = sum(r.total_bytes for r in results if r.deletable)
     print(f"{'  Total reclaimable':<30} {format_size(total):>10}")
 
     # Print notes for non-deletable items
