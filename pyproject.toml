@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "macpurge"
+version = "0.1.0"
+description = "CLI system maintenance tool for macOS"
+requires-python = ">=3.10"
+license = "MIT"
+
+[project.scripts]
+macpurge = "macpurge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
