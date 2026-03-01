@@ -2,83 +2,93 @@
 
 CLI system maintenance tool for macOS. No GUI, no black box, no phoning home. Every operation is transparent, auditable, and dry-run by default.
 
-## Install
+Built in Python. Zero external dependencies.
+
+## Quick Start
 
 ```bash
+git clone https://github.com/sohrab21/macpurge.git
 cd macpurge
+python3 -m venv .venv
+source .venv/bin/activate
 pip install .
 ```
 
-For development:
+Then add the alias to your shell so `macpurge` works from anywhere:
+
 ```bash
-pip install -e .
+echo 'alias macpurge="~/macpurge/.venv/bin/macpurge"' >> ~/.zshrc
+source ~/.zshrc
 ```
+
+> Adjust the path if you cloned to a different location.
+
+## Set Up Weekly Auto-Cleanup
+
+```bash
+macpurge schedule
+```
+
+Runs `macpurge clean --all --force` every 7 days automatically. Works even after sleep/standby.
 
 ## Usage
 
-### Quick system overview
 ```bash
-macpurge overview
+macpurge overview                  # System health snapshot
+macpurge scan                      # Show reclaimable space by category
+macpurge clean                     # Clean everything (asks for confirmation)
+macpurge clean --caches            # System + user + browser caches
+macpurge clean --logs              # Log files
+macpurge clean --xcode             # Xcode derived data, archives, device support
+macpurge clean --dev               # npm, yarn, pip, Homebrew caches
+macpurge clean --trash             # Empty Trash
+macpurge clean --ds-store          # .DS_Store files
+macpurge clean --temp              # Temp files
+macpurge clean --all --force       # Clean everything, skip confirmation
+macpurge big-files                 # Files > 500MB
+macpurge big-files --min 100MB     # Files > 100MB
+macpurge stale                     # Files not accessed in 180 days
+macpurge stale --days 90           # Files not accessed in 90 days
+macpurge uninstall "App Name"      # Full app removal + all associated files
+macpurge ram                       # Free RAM, show/kill top consumers
+macpurge log                       # Review audit logs
+macpurge schedule                  # Set up weekly auto-cleanup
+macpurge schedule --status         # Check if schedule is active
+macpurge schedule --remove         # Remove weekly schedule
 ```
 
-### Scan for reclaimable space
+## Contributing
+
 ```bash
-macpurge scan
+git clone https://github.com/sohrab21/macpurge.git
+cd macpurge
+python3 -m venv .venv
+source .venv/bin/activate
+pip install .
 ```
 
-### Clean reclaimable files
-```bash
-# Clean everything (shows summary, asks for confirmation)
-macpurge clean
+Make your changes in `src/macpurge/`, reinstall with `pip install .`, test, then submit a PR.
 
-# Clean specific categories
-macpurge clean --caches      # System + user + browser caches
-macpurge clean --logs        # Log files
-macpurge clean --xcode       # Xcode derived data, archives, device support
-macpurge clean --dev         # npm, yarn, pip, Homebrew caches
-macpurge clean --trash       # Empty Trash
-macpurge clean --ds-store    # .DS_Store files
-macpurge clean --temp        # Temp files
+### Project Structure
 
-# Skip confirmation (for scripting/cron)
-macpurge clean --force
 ```
-
-### Find large files
-```bash
-macpurge big-files                    # Files > 500MB in ~/
-macpurge big-files --min 100MB        # Files > 100MB
-macpurge big-files --path /Downloads  # Search specific path
-```
-
-### Find stale files
-```bash
-macpurge stale                  # Not accessed in 180 days
-macpurge stale --days 90        # Not accessed in 90 days
-macpurge stale --path ~/Videos  # Search specific path
-```
-
-### Uninstall an app completely
-```bash
-macpurge uninstall Slack        # Removes app + all associated files
-macpurge uninstall "Google Chrome" --force
-```
-
-### Free RAM
-```bash
-macpurge ram    # Show memory, offer to purge, list top consumers
-```
-
-### View logs
-```bash
-macpurge log           # Last 10 log files
-macpurge log --last 5  # Last 5 log files
+src/macpurge/
+  cli.py           # argparse entry point, all subcommands
+  scanner.py       # disk scanning (os.scandir-based)
+  cleaner.py       # deletion with dry-run + audit logging
+  uninstaller.py   # app removal via bundle ID + remnant search
+  memory.py        # RAM management (vm_stat, ps, purge)
+  overview.py      # system dashboard
+  schedule.py      # launchd weekly cleanup
+  logger.py        # audit logging to ~/.macpurge/logs/
+  paths.py         # all macOS paths centralized
+  utils.py         # formatting, size calculations, confirmations
 ```
 
 ## Design
 
 - **Dry-run by default.** Every destructive command shows what it would do and asks for confirmation. Use `--force` to skip.
-- **Auditable.** Every deletion logged to `~/.macpurge/logs/`.
+- **Auditable.** Every deletion logged to `~/.macpurge/logs/` with timestamp, path, and size.
 - **Safe.** Never touches `/System`, `/usr`, `~/Documents`, `~/Photos`, `~/Music` unless explicitly targeted.
 - **No dependencies.** Python standard library only.
 
