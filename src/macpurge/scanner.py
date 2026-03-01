@@ -183,10 +183,12 @@ def scan_big_files(min_bytes: int, root: Path, skip_dirs: set[str] | None = None
         if entry.is_file(follow_symlinks=False):
             try:
                 st = entry.stat(follow_symlinks=False)
-                if st.st_size >= min_bytes:
+                # Use st_blocks for actual disk usage (handles APFS sparse files)
+                actual_size = st.st_blocks * 512 if st.st_blocks else st.st_size
+                if actual_size >= min_bytes:
                     results.append(BigFileResult(
                         path=entry_path,
-                        size=st.st_size,
+                        size=actual_size,
                         modified=st.st_mtime,
                     ))
             except OSError:
