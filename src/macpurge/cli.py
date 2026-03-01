@@ -57,6 +57,11 @@ def main():
     # --- overview ---
     subparsers.add_parser("overview", help="System health snapshot")
 
+    # --- schedule ---
+    sched_p = subparsers.add_parser("schedule", help="Set up weekly automatic cleanup")
+    sched_p.add_argument("--remove", action="store_true", help="Remove the weekly schedule")
+    sched_p.add_argument("--status", action="store_true", help="Show schedule status")
+
     # --- log ---
     log_p = subparsers.add_parser("log", help="Review recent activity logs")
     log_p.add_argument("--last", type=int, default=10,
@@ -83,6 +88,8 @@ def main():
             _cmd_ram()
         elif args.command == "overview":
             _cmd_overview()
+        elif args.command == "schedule":
+            _cmd_schedule(args)
         elif args.command == "log":
             _cmd_log(args)
     except KeyboardInterrupt:
@@ -271,6 +278,17 @@ def _cmd_ram():
 def _cmd_overview():
     from .overview import show_overview
     show_overview()
+
+
+def _cmd_schedule(args):
+    from .schedule import setup_schedule, remove_schedule, show_status
+
+    if args.remove:
+        remove_schedule()
+    elif args.status:
+        show_status()
+    else:
+        setup_schedule()
 
 
 def _cmd_log(args):
