@@ -1,10 +1,14 @@
 # macpurge
 
-CLI system maintenance tool for macOS. No GUI, no black box, no phoning home. Every operation is transparent, auditable, and dry-run by default.
+System maintenance tool for macOS. No black box, no phoning home. Every operation is transparent, auditable, and dry-run by default.
 
-Built in Python. Zero external dependencies.
+Built in Python. Zero external dependencies for the CLI.
 
-## Quick Start
+## Just want the menu bar app?
+
+Download **[Macpurge.app from the latest release](https://github.com/sohrab21/macpurge/releases/latest)**, drop it into `/Applications`, right-click → Open the first time. Full team install instructions: [TEAM_README.md](TEAM_README.md).
+
+## Quick Start (CLI)
 
 ```bash
 git clone https://github.com/sohrab21/macpurge.git
@@ -23,13 +27,15 @@ source ~/.zshrc
 
 > Adjust the path if you cloned to a different location.
 
-## Set Up Weekly Auto-Cleanup
+## Set Up Auto-Cleanup
 
 ```bash
-macpurge schedule
+macpurge schedule                  # weekly (default)
+macpurge schedule --interval daily
+macpurge schedule --interval monthly
 ```
 
-Runs `macpurge clean --all --force` every 7 days automatically. Works even after sleep/standby.
+Runs `macpurge clean --all --force` on the chosen interval. Works even after sleep/standby. The menu bar app exposes the same choices in an "Automatic cleanup" submenu.
 
 ## Usage
 
@@ -52,9 +58,10 @@ macpurge stale --days 90           # Files not accessed in 90 days
 macpurge uninstall "App Name"      # Full app removal + all associated files
 macpurge ram                       # Free RAM, show/kill top consumers
 macpurge log                       # Review audit logs
-macpurge schedule                  # Set up weekly auto-cleanup
+macpurge schedule                  # Set up auto-cleanup (default: weekly)
+macpurge schedule --interval daily # Daily / weekly / monthly
 macpurge schedule --status         # Check if schedule is active
-macpurge schedule --remove         # Remove weekly schedule
+macpurge schedule --remove         # Remove the schedule
 ```
 
 ## Contributing

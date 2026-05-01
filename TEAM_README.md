@@ -24,8 +24,8 @@ Click the **macpurge** label in the menu bar:
 
 ## Install
 
-1. Download `Macpurge.zip` (whatever channel I shared it through — Slack,
-   Drive, etc.).
+1. Download **Macpurge.zip** from the latest release:
+   <https://github.com/sohrab21/macpurge/releases/latest>
 2. Unzip it. You'll get **Macpurge.app**.
 3. Drag **Macpurge.app** into your `/Applications` folder.
 4. **First launch (this is the annoying part):**
