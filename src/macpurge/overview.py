@@ -17,15 +17,19 @@ def show_overview() -> None:
     """Print system health snapshot."""
     _print_system_info()
     print()
-    _print_disk_info()
+    disk_total, disk_used, _ = _get_disk_usage()
+    _print_disk_info(disk_total, disk_used)
     print()
-    _print_ram_info()
+    mem_info = get_memory_info()
+    _print_ram_info(mem_info)
     print()
     _print_top_disk_dirs()
     print()
     _print_top_ram_processes()
     print()
-    _print_reclaimable_estimate()
+    reclaimable_total = _print_reclaimable_estimate()
+    print()
+    _print_recommendation(mem_info, disk_total, disk_used, reclaimable_total)
 
 
 def _print_system_info() -> None:
@@ -65,10 +69,9 @@ def _print_system_info() -> None:
         pass
 
 
-def _print_disk_info() -> None:
+def _print_disk_info(total: int, used: int) -> None:
     """Disk usage with bar visualization."""
-    total, used, free = _get_disk_usage()
-
+    free = total - used
     print("Disk Usage:")
     print(f"  Total:     {format_size(total)}")
     print(f"  Used:      {format_size(used)}")
@@ -118,9 +121,8 @@ def _format_bar(used: int, total: int, width: int = 30) -> str:
     return f"  [{'#' * filled}{'.' * (width - filled)}] {pct:.0%}"
 
 
-def _print_ram_info() -> None:
+def _print_ram_info(info) -> None:
     """RAM summary."""
-    info = get_memory_info()
     used = info.total_bytes - info.free_bytes - info.speculative_bytes
 
     print("Memory:")
@@ -170,17 +172,54 @@ def _print_top_ram_processes(n: int = 5) -> None:
         print(f"  {i}. {format_size(p.rss_bytes):>8}  {p.name} (PID {p.pid})")
 
 
-def _print_reclaimable_estimate() -> None:
-    """Quick scan for reclaimable space estimate."""
+def _print_reclaimable_estimate() -> int:
+    """Quick scan for reclaimable space estimate. Returns total bytes."""
     print("Reclaimable space (estimated):")
     results = scan_all(progress=False)
     total = sum(r.total_bytes for r in results)
     if total == 0:
         print("  No significant reclaimable space found.")
-        return
+        return 0
     for r in results:
         if r.total_bytes > 0:
             print(f"  {format_size(r.total_bytes):>10}  {r.category_name}")
     print(f"  {'─' * 35}")
     print(f"  {format_size(total):>10}  Total")
-    print(f"\nRun 'macpurge clean' to free this space.")
+    return total
+
+
+def _print_recommendation(
+    mem_info, disk_total: int, disk_used: int, reclaimable: int
+) -> None:
+    """Suggest the most impactful next command based on current state."""
+    used_ram = mem_info.total_bytes - mem_info.free_bytes - mem_info.speculative_bytes
+    ram_pct = used_ram / mem_info.total_bytes if mem_info.total_bytes else 0
+    swap_used = mem_info.swap_used_bytes > 0
+    disk_pct = disk_used / disk_total if disk_total else 0
+
+    gb = 1024 ** 3
+    print("Recommended next step:")
+    if ram_pct >= 0.85 or swap_used:
+        detail = f"{ram_pct:.0%} RAM used"
+        if swap_used:
+            detail += f", {format_size(mem_info.swap_used_bytes)} swap"
+        print(f"  Memory is under pressure ({detail}) → run `macpurge ram`.")
+        if reclaimable >= 5 * gb:
+            print(
+                f"  After that, ~{format_size(reclaimable)} is reclaimable → "
+                f"`macpurge scan`, then `macpurge clean`."
+            )
+    elif disk_pct >= 0.85:
+        print(f"  Disk is {disk_pct:.0%} full → run `macpurge scan`, then `macpurge clean`.")
+    elif reclaimable >= 5 * gb:
+        print(
+            f"  ~{format_size(reclaimable)} reclaimable → "
+            f"run `macpurge scan` (then `macpurge clean`)."
+        )
+    elif reclaimable >= 1 * gb:
+        print(
+            f"  Optional: ~{format_size(reclaimable)} reclaimable. "
+            f"Run `macpurge scan` to review."
+        )
+    else:
+        print("  System looks healthy. No action needed.")

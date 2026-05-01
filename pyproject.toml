@@ -11,6 +11,19 @@ license = "MIT"
 
 [project.scripts]
 macpurge = "macpurge.cli:main"
+macpurge-menubar = "macpurge.menubar:main"
+
+[project.optional-dependencies]
+# `pip install macpurge[gui]` for the menu bar app and bundle build.
+# Kept optional so the CLI itself stays stdlib-only.
+gui = [
+    "rumps>=0.4.0",
+]
+build = [
+    "rumps>=0.4.0",
+    "py2app>=0.28",
+    "Pillow>=10.0",  # icon generation only; not bundled at runtime
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -58,8 +58,12 @@ def main():
     subparsers.add_parser("overview", help="System health snapshot")
 
     # --- schedule ---
-    sched_p = subparsers.add_parser("schedule", help="Set up weekly automatic cleanup")
-    sched_p.add_argument("--remove", action="store_true", help="Remove the weekly schedule")
+    sched_p = subparsers.add_parser("schedule", help="Set up automatic cleanup")
+    sched_p.add_argument(
+        "--interval", choices=["daily", "weekly", "monthly"], default="weekly",
+        help="How often cleanup runs (default: weekly)",
+    )
+    sched_p.add_argument("--remove", action="store_true", help="Remove the schedule")
     sched_p.add_argument("--status", action="store_true", help="Show schedule status")
 
     # --- log ---
@@ -70,8 +74,9 @@ def main():
     args = parser.parse_args()
 
     if not args.command:
-        parser.print_help()
-        sys.exit(1)
+        # No subcommand → show the read-only dashboard. It ends with a
+        # "Recommended next step" line so the user knows what to run next.
+        args.command = "overview"
 
     try:
         if args.command == "scan":
@@ -288,7 +293,7 @@ def _cmd_schedule(args):
     elif args.status:
         show_status()
     else:
-        setup_schedule()
+        setup_schedule(args.interval)
 
 
 def _cmd_log(args):
