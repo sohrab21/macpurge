@@ -23,7 +23,8 @@ APP = ["launcher.py"]
 
 # Files copied to Contents/Resources/ inside the bundle.
 DATA_FILES = [
-    ("", ["resources/menubar_icon.png", "resources/menubar_icon@2x.png"]),
+    ("", ["resources/menubar_icon.png", "resources/menubar_icon@2x.png",
+            "resources/menubar_icon_alert.png", "resources/menubar_icon_alert@2x.png"]),
 ]
 
 OPTIONS = {
@@ -34,8 +35,8 @@ OPTIONS = {
         "CFBundleName": "Macpurge",
         "CFBundleDisplayName": "Macpurge",
         "CFBundleIdentifier": "com.sohrab.macpurge",
-        "CFBundleVersion": "0.1.0",
-        "CFBundleShortVersionString": "0.1.0",
+        "CFBundleVersion": "0.2.0",
+        "CFBundleShortVersionString": "0.2.0",
         "LSUIElement": True,               # menu-bar-only, no Dock icon
         "LSMinimumSystemVersion": "11.0",
         "NSHumanReadableCopyright": "MIT licensed",

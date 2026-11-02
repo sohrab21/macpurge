@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "macpurge"
-version = "0.1.0"
+version = "0.2.0"
 description = "CLI system maintenance tool for macOS"
 requires-python = ">=3.10"
 license = "MIT"
@@ -22,6 +22,7 @@ gui = [
 build = [
     "rumps>=0.4.0",
     "py2app>=0.28",
+    "setuptools<80",  # setuptools 84 breaks py2app 0.28 byte_compile (Popen verbose kwarg)
     "Pillow>=10.0",  # icon generation only; not bundled at runtime
 ]
 

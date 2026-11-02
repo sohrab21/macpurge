@@ -91,8 +91,41 @@ The CLI ships as a stdlib-only Python package. The menu bar app is an
 
 ### Menu bar app (`macpurge.menubar`)
 
-- Wraps the existing CLI — does not duplicate logic. `clean` is invoked via
-  subprocess so the audit log is written the same way as a CLI run.
+- Wraps the existing CLI — does not duplicate logic. `clean` is called
+  in-process (`scan_all` + `run_clean`), never via subprocess: inside the
+  bundle `Contents/MacOS/macpurge` is the same file as `Macpurge`
+  (case-insensitive APFS), so spawning it starts a second menu bar app.
+- `launcher.py` dispatches to the CLI when it gets a subcommand. The
+  launchd schedule calls `Contents/MacOS/macpurge clean --all --force`;
+  before this dispatch (fixed 02.11.2026) that started a second menu bar
+  icon that never exited.
+- **Single instance:** `main()` takes an `fcntl` lock on
+  `~/.macpurge/menubar.lock`; a second launch logs and exits. The OS drops
+  the lock when the process dies, so no stale locks.
+- **v0.2.0 menu** (02.11.2026): status lines (RAM + memory pressure, disk
+  free, last cleanup with "overdue" flag), "Apps using the most memory"
+  (top 5 apps grouped by .app bundle, click = polite AppleScript quit;
+  CLI processes are excluded on purpose), Scan now → submenus Reclaimable
+  space (clean per category), Large files and Old files (reveal in Finder
+  only, never delete), Unused apps (move to Trash via Finder, recoverable),
+  Open at login (LaunchAgent `com.macpurge.login`), About with the last 5
+  cleanups, keyboard shortcuts. Icon swaps to `menubar_icon_alert.png`
+  (sparkle + dot) when `kern.memorystatus_vm_pressure_level` >= 2.
+  Notifications: low disk (< 20 GB, max once a day) and "automatic cleanup
+  done" when a clean log appears that the GUI didn't write.
+- Read-only data logic lives in `insights.py` (GUI-free, testable).
+  Unused-app detection never trusts Spotlight alone: an app is "unused"
+  only if not running AND its data folders, extension containers, the
+  developer's group containers (by codesign TeamIdentifier, e.g. Office's
+  `UBF8T346G9.Office`) and Spotlight all show nothing for 60 days.
+  Without the group-container check, Outlook showed as "1353 days unused".
+- Menu changes from worker threads go through `_on_main` (queue drained by
+  a 0.5s main-thread timer). One long job at a time (`_busy` lock).
+- **Full Disk Access:** the background scan reads other apps' containers.
+  Without FDA, macOS shows a privacy prompt and the scan thread blocks in
+  `open()` until it is answered. So the app probes FDA first (reading
+  TCC.db fails instantly with EPERM, no prompt), shows "Full Disk Access
+  missing · click to fix" and skips scans until it is granted.
 - Privileged operations (`purge`, system cache cleanup) use `osascript ...
   with administrator privileges` to surface the native macOS password
   prompt. The CLI's `purge_memory()` requires a TTY and won't work from a
@@ -110,6 +143,17 @@ python -m macpurge.menubar
 
 ### Building Macpurge.app
 
+**Use the script:** `bash tools/build_app.sh` does everything below
+(stage outside iCloud, Python 3.13, setuptools<80, site.pyo fix, sign,
+install, relaunch, refresh `dist-share/Macpurge.zip`). The manual steps
+below are kept as reference for when the script breaks.
+
+**Stable signing:** `tools/make_signing_cert.sh` (run once, by Sohrab;
+it writes to the login keychain) creates the identity "Macpurge
+Self-Signed". The build script signs with it when present, so macOS keeps
+Full Disk Access across rebuilds. Without it, builds are ad-hoc signed and
+FDA must be re-granted after every install.
+
 **Stage outside iCloud.** This project lives under `~/Desktop` which is
 iCloud Drive synced. The iCloud File Provider keeps re-applying
 `com.apple.fileprovider.fpfs#P` and `com.apple.FinderInfo` xattrs to every
@@ -126,6 +170,13 @@ cd /tmp/macpurge-build && rm -rf .venv build dist
 ```
 
 Output: `dist/Macpurge.app` (~38 MB).
+
+**Pin `setuptools<80`** (in the `build` extra). setuptools 84 breaks
+py2app 0.28 with `Popen.__init__() got an unexpected keyword argument
+'verbose'`.
+
+**Patch `site.pyo` before `xattr -c`**, otherwise `find ... xattr -c`
+aborts on the dangling symlink and signing never runs.
 
 **Use Python 3.13, not 3.14.** rumps 0.4.0 + PyObjC + Python 3.14 builds
 fine but the menu bar item silently never renders (NSStatusItem API

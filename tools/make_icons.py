@@ -86,6 +86,27 @@ def make_menubar_icon() -> None:
         print(f"  wrote {out.relative_to(ROOT)}")
 
 
+def make_menubar_alert_icon() -> None:
+    """Same sparkle plus a dot top-right: shown when memory pressure is high.
+    Template images are monochrome, so the signal is shape, not colour."""
+    for px, suffix in [(22, ""), (44, "@2x")]:
+        s = px * 8
+        img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        _draw_sparkle(draw, cx=s * 0.44, cy=s * 0.54, vertical_len=s * 0.42,
+                      horizontal_len=s * 0.33, petal_width=s * 0.08,
+                      fill=(0, 0, 0, 255))
+        r, cx, cy = s * 0.15, s * 0.82, s * 0.18
+        # Clear a ring around the dot so it reads as separate from the star.
+        ring = r + s * 0.06
+        draw.ellipse((cx - ring, cy - ring, cx + ring, cy + ring), fill=(0, 0, 0, 0))
+        draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(0, 0, 0, 255))
+        img = img.resize((px, px), Image.LANCZOS)
+        out = RESOURCES / f"menubar_icon_alert{suffix}.png"
+        img.save(out, "PNG")
+        print(f"  wrote {out.relative_to(ROOT)}")
+
+
 def _color_app_icon(size: int) -> Image.Image:
     """Full-color sparkle on a soft rounded backdrop."""
     s = size * 4
@@ -191,6 +212,7 @@ def make_app_icon() -> None:
 if __name__ == "__main__":
     print("Generating menu bar icon…")
     make_menubar_icon()
+    make_menubar_alert_icon()
     print("Generating app icon (.icns)…")
     make_app_icon()
     print("Done.")
