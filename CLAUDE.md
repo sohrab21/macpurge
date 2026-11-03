@@ -249,14 +249,24 @@ internal sharing. If we ever want clean install with no warnings, the path
 is: enroll → codesign with Developer ID → notarize via `notarytool` →
 staple. Not worth it unless the audience grows.
 
-### Future GUI work
+### Open items (as of 03.11.2026)
 
-- Bundle a real template icon (PNG/PDF, black-on-transparent) at
-  `resources/macpurge.icns` and reference it in `setup_py2app.py` plist +
-  `OPTIONS["iconfile"]`. Currently the menu bar shows the text "macpurge".
-- Universal2 build for Intel support.
-- A SwiftUI front-end calling the same CLI is a clean upgrade path if a
-  windowed app is ever wanted — keep CLI as the single source of truth.
+- **Verify FDA survives a rebuild:** after Sohrab re-grants Full Disk
+  Access to the "Macpurge Build"-signed app, the next `build_app.sh` run
+  should NOT log "Full Disk Access missing". Confirm on the next update.
+- **Menu click-through not yet tested by Sohrab** (quit an app from "Apps
+  using the most memory", the four scan submenus). The data side was
+  tested against his Mac on 02.11.
+- **Unused-app detection:** watch for false positives (an app in use that
+  shows up as unused). Outlook/Excel/OneNote were false positives before
+  the group-container check.
+- **Tests** for `insights.unused_apps` / `app_leftovers` (the risky parts).
+- **Re-send `dist-share/Macpurge.zip`** to teammates: older copies have the
+  duplicate-icon bug. Teammates' copies are signed with Sohrab's
+  self-signed cert, so they still see the Gatekeeper warning.
+- Later, only if teammates use it: update check (needs a public version
+  endpoint; the repo is private), Universal2 build for Intel Macs,
+  Developer ID + notarization.
 
 ## GitHub
 
