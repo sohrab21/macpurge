@@ -148,11 +148,17 @@ python -m macpurge.menubar
 install, relaunch, refresh `dist-share/Macpurge.zip`). The manual steps
 below are kept as reference for when the script breaks.
 
-**Stable signing:** `tools/make_signing_cert.sh` (run once, by Sohrab;
-it writes to the login keychain) creates the identity "Macpurge
-Self-Signed". The build script signs with it when present, so macOS keeps
-Full Disk Access across rebuilds. Without it, builds are ad-hoc signed and
-FDA must be re-granted after every install.
+**Stable signing:** `tools/make_signing_cert.sh` (run once, by Sohrab in
+Terminal; auto mode blocks keychain writes) creates the identity "Macpurge
+Build" in its own keychain `~/Library/Keychains/macpurge-signing.keychain-db`
+with a random password in `~/.macpurge/signing-keychain-pass`. The build
+script unlocks it and signs with it, so there are no keychain dialogs and
+the designated requirement (identifier + certificate leaf) stays the same,
+so Full Disk Access survives rebuilds. The login keychain is not used: its
+password differs from the Mac password on this machine, and codesign
+prompts per subcomponent there (`errSecInternalComponent` when run
+non-interactively). A leftover "Macpurge Self-Signed" identity in the login
+keychain is unused.
 
 **Stage outside iCloud.** This project lives under `~/Desktop` which is
 iCloud Drive synced. The iCloud File Provider keeps re-applying

@@ -1,13 +1,26 @@
 #!/bin/bash
-# One-time: create a self-signed code-signing identity "Macpurge Self-Signed"
-# in the login keychain. Signing every build with the same identity keeps the
-# app's identity stable, so macOS keeps Full Disk Access across rebuilds
-# (ad-hoc signatures change with every build and lose it).
+# One-time: create the code-signing identity "Macpurge Build" in its OWN
+# keychain (~/Library/Keychains/macpurge-signing.keychain-db) with a random
+# password stored in ~/.macpurge/signing-keychain-pass (chmod 600).
+# The build script unlocks that keychain itself, so codesign never needs the
+# login keychain password and no "codesign wants to access key" dialogs appear.
+# Same identity on every build = stable app identity = Full Disk Access survives.
 set -euo pipefail
-NAME="Macpurge Self-Signed"
-if security find-certificate -c "$NAME" >/dev/null 2>&1; then
-  echo "\"$NAME\" already exists in your keychain. Nothing to do."; exit 0
+NAME="Macpurge Build"
+KC="$HOME/Library/Keychains/macpurge-signing.keychain-db"
+PASSFILE="$HOME/.macpurge/signing-keychain-pass"
+
+if [[ -f "$KC" && -f "$PASSFILE" ]]; then
+  echo "Signing keychain already exists. Nothing to do."; exit 0
 fi
+mkdir -p "$(dirname "$PASSFILE")"
+KCPASS=$(openssl rand -hex 24)
+( umask 077; printf '%s' "$KCPASS" > "$PASSFILE" )
+
+security create-keychain -p "$KCPASS" "$KC"
+security set-keychain-settings "$KC"            # no auto-lock timeout
+security unlock-keychain -p "$KCPASS" "$KC"
+
 D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
 cat > "$D/cert.cnf" <<CNF
 [req]
@@ -27,5 +40,11 @@ P=$(openssl rand -hex 12)
 openssl pkcs12 -export -legacy -inkey "$D/key.pem" -in "$D/cert.pem" -out "$D/id.p12" \
   -passout pass:"$P" 2>/dev/null \
   || openssl pkcs12 -export -inkey "$D/key.pem" -in "$D/cert.pem" -out "$D/id.p12" -passout pass:"$P"
-security import "$D/id.p12" -k ~/Library/Keychains/login.keychain-db -P "$P" -T /usr/bin/codesign
-echo "Created \"$NAME\". Now run: bash tools/build_app.sh"
+security import "$D/id.p12" -k "$KC" -P "$P" -T /usr/bin/codesign
+# Let Apple tools (codesign) use the key without a dialog.
+security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPASS" "$KC" >/dev/null
+
+# Add to the keychain search list (keeping the existing ones).
+EXISTING=$(security list-keychains -d user | sed 's/[" ]//g')
+security list-keychains -d user -s $EXISTING "$KC"
+echo "Created \"$NAME\" in its own keychain. Builds now sign without dialogs."

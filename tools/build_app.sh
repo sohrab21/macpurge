@@ -8,7 +8,9 @@ set -euo pipefail
 PROJ="$(cd "$(dirname "$0")/.." && pwd)"
 STAGE=/tmp/macpurge-build
 APP=/Applications/Macpurge.app
-IDENTITY="Macpurge Self-Signed"
+IDENTITY="Macpurge Build"
+KC="$HOME/Library/Keychains/macpurge-signing.keychain-db"
+PASSFILE="$HOME/.macpurge/signing-keychain-pass"
 INSTALL=1; [[ "${1:-}" == "--no-install" ]] && INSTALL=0
 
 echo "▸ Staging in $STAGE"
@@ -28,10 +30,10 @@ B=dist/Macpurge.app
 cp "$B/Contents/Resources/site.pyc" "$B/Contents/Resources/site.pyo"   # broken symlink fix
 find "$B" -exec xattr -c {} +
 
-if security find-identity -p codesigning | grep -q "$IDENTITY" || \
-   security find-certificate -c "$IDENTITY" >/dev/null 2>&1; then
+if [[ -f "$KC" && -f "$PASSFILE" ]]; then
   echo "▸ Signing with \"$IDENTITY\" (Full Disk Access survives rebuilds)"
-  codesign --force --deep --sign "$IDENTITY" "$B"
+  security unlock-keychain -p "$(cat "$PASSFILE")" "$KC"
+  codesign --force --deep --keychain "$KC" --sign "$IDENTITY" "$B"
 else
   echo "▸ Ad-hoc signing. Full Disk Access must be re-granted after install."
   echo "  Run tools/make_signing_cert.sh once to fix that."
