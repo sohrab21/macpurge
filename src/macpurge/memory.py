@@ -34,11 +34,11 @@ def get_memory_info() -> MemoryInfo:
     """Parse vm_stat and sysctl to get memory state."""
     # Total RAM
     total = int(subprocess.check_output(
-        ["sysctl", "-n", "hw.memsize"], text=True
+        ["sysctl", "-n", "hw.memsize"], encoding="utf-8", errors="replace"
     ).strip())
 
     # vm_stat for page-level breakdown
-    vm_output = subprocess.check_output(["vm_stat"], text=True)
+    vm_output = subprocess.check_output(["vm_stat"], encoding="utf-8", errors="replace")
     lines = vm_output.strip().splitlines()
 
     # Parse page size from first line
@@ -69,7 +69,7 @@ def get_memory_info() -> MemoryInfo:
     swap_total = 0
     try:
         swap_output = subprocess.check_output(
-            ["sysctl", "-n", "vm.swapusage"], text=True
+            ["sysctl", "-n", "vm.swapusage"], encoding="utf-8", errors="replace"
         ).strip()
         swap_match = re.search(
             r"total\s*=\s*([\d.]+)M\s+used\s*=\s*([\d.]+)M", swap_output
@@ -97,7 +97,7 @@ def get_top_processes(n: int = 10) -> list[ProcessInfo]:
     try:
         output = subprocess.check_output(
             ["ps", "-eo", "pid,pmem,rss,comm", "-m"],
-            text=True, stderr=subprocess.DEVNULL,
+            encoding="utf-8", errors="replace", stderr=subprocess.DEVNULL,
         )
     except (subprocess.CalledProcessError, OSError):
         return []

@@ -43,7 +43,7 @@ def _print_system_info() -> None:
     # Chip
     try:
         chip = subprocess.check_output(
-            ["sysctl", "-n", "machdep.cpu.brand_string"], text=True
+            ["sysctl", "-n", "machdep.cpu.brand_string"], encoding="utf-8", errors="replace"
         ).strip()
     except (subprocess.CalledProcessError, OSError):
         chip = platform.processor() or "Unknown"
@@ -52,7 +52,7 @@ def _print_system_info() -> None:
     # Uptime
     try:
         boottime_str = subprocess.check_output(
-            ["sysctl", "-n", "kern.boottime"], text=True
+            ["sysctl", "-n", "kern.boottime"], encoding="utf-8", errors="replace"
         ).strip()
         match = re.search(r"sec\s*=\s*(\d+)", boottime_str)
         if match:
@@ -83,7 +83,7 @@ def _get_disk_usage() -> tuple[int, int, int]:
     """Get disk total/used/free. Try diskutil first for APFS accuracy."""
     try:
         output = subprocess.check_output(
-            ["diskutil", "info", "/"], text=True
+            ["diskutil", "info", "/"], encoding="utf-8", errors="replace"
         )
         total = _parse_diskutil_bytes(output, "Container Total Space")
         free = _parse_diskutil_bytes(output, "Container Free Space")

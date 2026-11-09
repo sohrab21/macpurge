@@ -7,15 +7,18 @@ Run during development:
 Or, when packaged as Macpurge.app, just launch the app from /Applications.
 
 Design notes:
-- All destructive actions show a confirmation alert before running. Files
-  and apps are only ever moved to the Trash (recoverable); caches/logs are
-  deleted by the cleaner as before.
+- All destructive actions show a confirmation alert before running. Large
+  and old files are only revealed in Finder. Apps are deleted for good from
+  the Uninstall apps window (after a confirmation that says so);
+  caches/logs are deleted by the cleaner as before.
 - `purge` needs root. The CLI uses sudo + TTY, which doesn't work inside a
   .app bundle, so the GUI routes it through `osascript ... with
   administrator privileges` (native password prompt).
 - Long-running work runs on daemon threads. Anything that touches the menu
-  (titles, submenus, the icon) or shows an alert is queued with `_on_main`
-  and applied by a 0.5s timer on the main thread — Cocoa requires it.
+  (titles, submenus, the icon) or shows an alert goes through `_on_main`
+  (AppHelper.callAfter → main thread), as Cocoa requires.
+- Status comes from one background sampler thread (livemem: sysctl +
+  libproc, no subprocesses), every 60 s, every 15 s under memory pressure.
 - __init__ does NOT call any subprocess. If status reads fail in a bundle,
   we still want the menu bar item to register; the first timer tick fills
   in real values and every read is wrapped in try/except.
@@ -23,25 +26,29 @@ Design notes:
 
 import fcntl
 import logging
+import os
 import plistlib
-import queue
+import signal
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
+import objc
 import rumps
+from AppKit import NSWorkspace
+from Foundation import NSObject
+from PyObjCTools import AppHelper
 
 from . import __version__
-from . import insights
+from . import insights, livemem, privileged
 from .cleaner import clean as run_clean
-from .memory import get_memory_info
 from .scanner import scan_all
 from .schedule import (
     INTERVALS, PLIST_PATH, current_interval, remove_schedule, setup_schedule,
 )
-from .utils import format_size, shorten_path
+from .utils import format_size
 
 LOG_DIR = Path.home() / ".macpurge" / "logs"
 LOCK_PATH = Path.home() / ".macpurge" / "menubar.lock"
@@ -49,7 +56,11 @@ LOGIN_LABEL = "com.macpurge.login"
 LOGIN_PLIST = Path.home() / "Library/LaunchAgents" / f"{LOGIN_LABEL}.plist"
 APP_PATH = "/Applications/Macpurge.app"
 
-STATUS_EVERY = 30                 # seconds: RAM, pressure, disk, top apps
+STATUS_SLOW = 60                  # seconds between samples while pressure is normal
+STATUS_FAST = 15                  # … while memory is tight (catch runaways early)
+TOP_N = 8                         # rows in "Using the most memory"
+IDLE_MIN_BYTES = 1024**3          # idle apps: only those holding 1 GB+
+IDLE_AFTER = 2 * 3600             # … and not in front for 2 hours
 RESCAN_EVERY = 12 * 3600          # seconds: background disk/apps scan
 LOW_DISK_BYTES = 20 * 1024**3     # warn below 20 GB free
 LOW_DISK_NOTIFY_EVERY = 24 * 3600
@@ -83,25 +94,32 @@ class MacpurgeApp(rumps.App):
         super().__init__("Macpurge", icon=self._icon_normal, template=True, quit_button=None)
         log.info("rumps.App initialized; icon=%s", self._icon_normal)
 
-        self._ui: queue.Queue = queue.Queue()
         self._busy = threading.Lock()          # one scan/clean/uninstall at a time
         self._scan_results = []
         self._own_clean = False                # True while the GUI itself cleans
         self._seen_log = self._newest_clean_log()
         self._last_disk_warning = 0.0
-        self._last_scan = 0.0
-        self._pressure = insights.PRESSURE_NORMAL
+        self._last_scan = time.time()          # no scan at login; first auto scan after RESCAN_EVERY
+        self._pressure = livemem.NORMAL
+        self._consumers: list[livemem.Consumer] = []
+        self._wake = threading.Event()         # set → sampler runs now
+        self._watch = livemem.RunawayWatch()
+        self._activity = livemem.ActivityLog()
+        self._observer = _ActivationObserver.alloc().init().setup(self._activity)
         self._fda = True
         self.fda_item = rumps.MenuItem(FDA_MISSING, callback=self.fix_fda)
 
         # --- status lines (greyed, informational) ---
-        self.ram_item = _placeholder("RAM: …")
+        self.ram_item = _placeholder("Memory pressure: …")
+        self.swap_item = _placeholder("Swap: …")
         self.disk_item = _placeholder("Disk: …")
         self.last_clean_item = _placeholder("Last cleanup: …")
 
         # --- memory ---
-        self.top_apps_menu = rumps.MenuItem("Apps using the most memory")
+        self.top_apps_menu = rumps.MenuItem("Using the most memory")
         self.top_apps_menu.add(_placeholder("Loading…"))
+        self.idle_menu = rumps.MenuItem("Idle apps holding memory")
+        self.idle_menu.add(_placeholder("Loading…"))
 
         # --- disk submenus, filled by a scan ---
         self.reclaim_menu = rumps.MenuItem("Reclaimable space")
@@ -110,6 +128,7 @@ class MacpurgeApp(rumps.App):
         self.unused_menu = rumps.MenuItem("Unused apps (60+ days)")
         for m in (self.reclaim_menu, self.large_menu, self.old_menu, self.unused_menu):
             m.add(_placeholder("Not scanned yet"))
+        self._uninstall_window = None
         self.scan_item = rumps.MenuItem("Scan now", callback=self.scan, key="s")
 
         # --- schedule submenu with radio-style checkmarks ---
@@ -123,13 +142,17 @@ class MacpurgeApp(rumps.App):
         for name in INTERVALS:
             schedule_menu.add(self._sched_options[name])
         self.login_item = rumps.MenuItem("Open at login", callback=self.toggle_login)
+        self.nopass_item = rumps.MenuItem("Free RAM without password",
+                                          callback=self.toggle_passwordless)
 
         self.menu = [
             self.ram_item,
+            self.swap_item,
             self.disk_item,
             self.last_clean_item,
             None,
             self.top_apps_menu,
+            self.idle_menu,
             rumps.MenuItem("Free RAM now…", callback=self.free_ram, key="r"),
             None,
             self.scan_item,
@@ -137,37 +160,36 @@ class MacpurgeApp(rumps.App):
             self.large_menu,
             self.old_menu,
             self.unused_menu,
+            rumps.MenuItem("Uninstall apps…", callback=lambda _: self.open_uninstaller(), key="u"),
             rumps.MenuItem("Clean caches now…", callback=self.clean_all, key="k"),
             None,
             schedule_menu,
             self.login_item,
+            self.nopass_item,
             rumps.MenuItem("Open log folder", callback=self.open_logs, key="l"),
             None,
             rumps.MenuItem("About Macpurge…", callback=self.about),
             rumps.MenuItem("Quit", callback=lambda _: rumps.quit_application(), key="q"),
         ]
 
-        rumps.Timer(self._pump, 0.5).start()
-        self.timer = rumps.Timer(self._tick, STATUS_EVERY)
-        self.timer.start()
-        rumps.Timer(self._first_tick, 1).start()
+        rumps.Timer(self._start_sampler, 1).start()
 
     # ------------------------------------------------------------------ plumbing
 
     def _on_main(self, fn, *args) -> None:
         """Run fn(*args) on the main thread (menu/icon/alert changes)."""
-        self._ui.put((fn, args))
+        AppHelper.callAfter(self._guarded, fn, args)
 
-    def _pump(self, _) -> None:
-        while True:
-            try:
-                fn, args = self._ui.get_nowait()
-            except queue.Empty:
-                return
-            try:
-                fn(*args)
-            except Exception:
-                log.exception("UI update failed")
+    @staticmethod
+    def _guarded(fn, args) -> None:
+        try:
+            fn(*args)
+        except Exception:
+            log.exception("UI update failed")
+
+    def refresh_soon(self) -> None:
+        """Ask the sampler for a fresh reading now (after quit, clean, …)."""
+        self._wake.set()
 
     def _background(self, label: str, fn) -> bool:
         """Run fn on a worker thread unless another long job is running."""
@@ -196,31 +218,61 @@ class MacpurgeApp(rumps.App):
 
     # ------------------------------------------------------------------ status
 
-    def _first_tick(self, sender) -> None:
+    def _start_sampler(self, sender) -> None:
         sender.stop()
-        self._tick(None)
+        threading.Thread(target=self._sampler, name="sampler", daemon=True).start()
 
-    def _tick(self, _) -> None:
-        """Cheap status refresh on the main thread, every STATUS_EVERY s."""
-        self._refresh_fda()
-        self._refresh_ram()
-        self._refresh_top_apps()
-        self._refresh_disk()
+    def _sampler(self) -> None:
+        """Background loop: read everything (no subprocesses), then hand the
+        result to the main thread. Slower while memory pressure is normal."""
+        while True:
+            interval = STATUS_SLOW
+            try:
+                sample = self._collect()
+                if sample["mem"].pressure != livemem.NORMAL:
+                    interval = STATUS_FAST
+                self._on_main(self._apply, sample)
+            except Exception:
+                log.exception("sampling failed")
+            self._wake.wait(interval)
+            self._wake.clear()
+
+    def _collect(self) -> dict:
+        cons = livemem.consumers()
+        return {
+            "mem": livemem.system_memory(),
+            "consumers": cons,
+            "alerts": self._watch.update(cons),
+            "fda": insights.has_full_disk_access(),
+            "disk": insights.disk_free_bytes(),
+            "login": LOGIN_PLIST.exists(),
+            "nopass": privileged.passwordless_enabled(),
+        }
+
+    def _apply(self, s: dict) -> None:
+        """Main thread: show a sample."""
+        self._refresh_fda(s["fda"])
+        self._show_memory(s["mem"], s["consumers"])
+        for c in s["alerts"]:
+            rumps.notification(
+                "Macpurge", f"{c.name} is using {livemem.format_gb(c.footprint)}",
+                f"{c.growing.capitalize()}. Open the Macpurge menu if you want to quit it.")
+        self._refresh_disk(s["disk"])
         self._refresh_cleanup_status()
         try:
             self._refresh_schedule_marks()
-            self.login_item.state = LOGIN_PLIST.exists()
+            self.login_item.state = s["login"]
+            self.nopass_item.state = s["nopass"]
         except Exception as exc:
             log.warning("schedule read failed: %s", exc)
-        # Without FDA a scan blocks forever on a macOS privacy prompt, so the
-        # automatic scan only runs once access is granted.
-        if (self._fda and time.time() - self._last_scan > RESCAN_EVERY
-                and not self._busy.locked()):
+        # Background scan: never at login, never while memory is tight, and
+        # only with Full Disk Access (else it blocks on a privacy prompt).
+        if (self._fda and self._pressure == livemem.NORMAL
+                and time.time() - self._last_scan > RESCAN_EVERY and not self._busy.locked()):
             self._last_scan = time.time()
             self._background("Scan", lambda: self._do_scan(notify=False))
 
-    def _refresh_fda(self) -> None:
-        has = insights.has_full_disk_access()
+    def _refresh_fda(self, has: bool) -> None:
         if has == self._fda:
             return
         self._fda = has
@@ -228,7 +280,7 @@ class MacpurgeApp(rumps.App):
             del self.menu[FDA_MISSING]
             log.info("Full Disk Access granted")
         else:
-            self.menu.insert_before("RAM: …", self.fda_item)  # rumps keys = title at insert time
+            self.menu.insert_before(self.ram_item.title, self.fda_item)  # rumps keys = title at insert time
             log.warning("Full Disk Access missing")
 
     def fix_fda(self, _) -> None:
@@ -241,47 +293,58 @@ class MacpurgeApp(rumps.App):
         )
         insights.open_fda_settings()
 
-    def _refresh_ram(self) -> None:
-        try:
-            info = get_memory_info()
-            used = info.total_bytes - info.free_bytes - info.speculative_bytes
-            pct = used / info.total_bytes if info.total_bytes else 0
-            self._pressure = insights.memory_pressure()
-            label = {
-                insights.PRESSURE_NORMAL: "",
-                insights.PRESSURE_WARN: " · memory is tight",
-                insights.PRESSURE_CRITICAL: " · memory is critically low",
-            }[self._pressure]
-            self.ram_item.title = f"RAM: {pct:.0%} used{label}"
-            alert = self._pressure != insights.PRESSURE_NORMAL
-            wanted = self._icon_alert if alert else self._icon_normal
-            if wanted and self.icon != wanted:
-                self.icon = wanted
-        except Exception as exc:
-            log.warning("RAM read failed: %s", exc)
-            self.ram_item.title = "RAM: unavailable"
+    def _show_memory(self, mem: "livemem.SystemMemory", cons: list) -> None:
+        self._pressure = mem.pressure
+        self._consumers = cons
+        self.ram_item.title = "Memory pressure: " + {
+            livemem.NORMAL: "normal", livemem.WARN: "high", livemem.CRITICAL: "critical",
+        }[mem.pressure]
+        self.swap_item.title = (f"Swap: {livemem.format_gb(mem.swap)} in use"
+                                if mem.swap >= 100 * 1024**2 else "Swap: not in use")
+        growing = any(c.growing for c in cons)
+        wanted = self._icon_alert if (mem.pressure != livemem.NORMAL or growing) else self._icon_normal
+        if wanted and self.icon != wanted:
+            self.icon = wanted
 
-    def _refresh_top_apps(self) -> None:
-        try:
-            apps = insights.top_apps_by_memory(5)
-        except Exception as exc:
-            log.warning("top apps failed: %s", exc)
-            return
-        items = [
-            rumps.MenuItem(f"{a.name}  ·  {format_size(a.rss_bytes)}",
-                           callback=lambda _, a=a: self._quit_app(a))
-            for a in apps
-        ] or [_placeholder("No apps found")]
-        items += [None, _placeholder("Click an app to quit it")]
+        items = []
+        for c in cons[:TOP_N]:
+            label = f"{c.name}  ·  {livemem.format_gb(c.footprint)}"
+            if c.growing:
+                label += f"  ·  {c.growing}"
+            quittable = c.kind == "app" or (c.kind == "cli" and not c.system) or \
+                (c.kind == "vm" and c.app_path)
+            items.append(rumps.MenuItem(label, callback=(lambda _, c=c: self._ask_quit(c))
+                                        if quittable else None))
+        items += [None, _placeholder("Includes GPU memory · click to quit")]
         self._fill(self.top_apps_menu, items)
+        self._show_idle(cons)
 
-    def _refresh_disk(self) -> None:
-        try:
-            free = insights.disk_free_bytes()
-        except Exception as exc:
-            log.warning("disk read failed: %s", exc)
-            self.disk_item.title = "Disk: unavailable"
-            return
+    def _show_idle(self, cons: list) -> None:
+        """Regular apps that hold 1 GB+ and haven't been in front for 2 h."""
+        by_path = {c.app_path: c for c in cons if c.kind == "app"}
+        rows = []
+        for ra in NSWorkspace.sharedWorkspace().runningApplications():
+            url = ra.bundleURL()
+            if ra.activationPolicy() != 0 or ra.isActive() or url is None:
+                continue
+            c = by_path.get(str(url.path()))
+            if c is None or c.footprint < IDLE_MIN_BYTES:
+                continue
+            launched = ra.launchDate().timeIntervalSince1970() if ra.launchDate() else None
+            idle = self._activity.idle_seconds(c.app_path, launched)
+            if idle >= IDLE_AFTER:
+                rows.append((c, idle))
+        rows.sort(key=lambda r: r[0].footprint, reverse=True)
+        items = [
+            rumps.MenuItem(f"{c.name}  ·  {livemem.format_gb(c.footprint)}  ·  idle {_hours(idle)}",
+                           callback=lambda _, c=c, idle=idle: self._ask_quit(c, idle))
+            for c, idle in rows
+        ]
+        if items:
+            items += [None, _placeholder("Not used for 2+ hours · click to quit")]
+        self._fill(self.idle_menu, items or [_placeholder("No idle apps holding 1 GB or more")])
+
+    def _refresh_disk(self, free: int) -> None:
         low = free < LOW_DISK_BYTES
         self.disk_item.title = f"Disk: {format_size(free)} free" + (" · running low" if low else "")
         if low and time.time() - self._last_disk_warning > LOW_DISK_NOTIFY_EVERY:
@@ -324,49 +387,95 @@ class MacpurgeApp(rumps.App):
 
     # ------------------------------------------------------------------ memory
 
-    def _quit_app(self, app: insights.AppMemory) -> None:
-        if not _confirm(f"Quit {app.name}?",
-                        f"{app.name} is using {format_size(app.rss_bytes)} of memory.\n\n"
-                        "It will be asked to quit normally, so you can still save "
-                        "unsaved work."):
+    def _ask_quit(self, c: "livemem.Consumer", idle: float | None = None) -> None:
+        """Always asks first. Apps get a normal quit (they can save); CLI
+        programs get SIGTERM; a VM is stopped by quitting the app that owns it."""
+        size = livemem.format_gb(c.footprint)
+        if c.kind == "cli":
+            n = len(c.pids)
+            title = f"Stop {c.name}?"
+            msg = (f"{c.name} is using {size} ({n} process{'es' if n != 1 else ''}, "
+                   f"PID {', '.join(map(str, c.pids[:6]))}{'…' if n > 6 else ''}).\n\n"
+                   "It is asked to stop (SIGTERM), like closing it in Terminal. "
+                   "Unsaved work in that program may be lost.")
+        else:
+            app_name = Path(c.app_path).stem if c.app_path else c.name
+            title = f"Quit {app_name}?"
+            what = f"Its virtual machine is using {size}" if c.kind == "vm" else f"It is using {size}"
+            if idle is not None:
+                what += f" and hasn't been used for {_hours(idle)}"
+            msg = (f"{what}.\n\n{app_name} is asked to quit normally, "
+                   "so you can still save unsaved work.")
+        if c.growing:
+            msg = f"{c.name} has been {c.growing}.\n\n" + msg
+        if not _confirm(title, msg):
             return
-
-        def run():
-            if insights.quit_app(app):
-                rumps.notification("Macpurge", f"{app.name} quit",
-                                   f"About {format_size(app.rss_bytes)} of memory freed.")
-            else:
-                rumps.notification("Macpurge", f"{app.name} did not quit",
-                                   "It may be waiting for you (unsaved changes?).")
-            time.sleep(2)
-            self._on_main(self._tick, None)
-
-        threading.Thread(target=run, daemon=True).start()
+        if c.kind == "cli":
+            stopped = 0
+            for pid in c.pids:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    stopped += 1
+                except OSError:
+                    pass
+            ok = stopped > 0
+        else:
+            ok = False
+            for ra in NSWorkspace.sharedWorkspace().runningApplications():
+                url = ra.bundleURL()
+                if url is not None and str(url.path()) == c.app_path:
+                    ok = bool(ra.terminate()) or ok
+        if not ok:
+            rumps.notification("Macpurge", f"{c.name} did not stop",
+                               "It may be waiting for you (unsaved changes?).")
+        threading.Timer(3, self.refresh_soon).start()
 
     def free_ram(self, _) -> None:
-        if not _confirm("Free RAM",
-                        "Run `purge` to reclaim inactive memory?\n\n"
-                        "macOS will ask for your password. Tip: quitting a big app from "
-                        "'Apps using the most memory' usually frees more."):
+        if not privileged.passwordless_enabled() and not _confirm(
+            "Free RAM",
+            "Run `purge` to reclaim inactive memory?\n\n"
+            "macOS will ask for your password. To skip the password next time, "
+            "turn on 'Free RAM without password' in this menu.\n\n"
+            "Tip: quitting a big app from 'Apps using the most memory' usually frees more.",
+        ):
             return
         threading.Thread(target=self._do_free_ram, daemon=True).start()
 
     def _do_free_ram(self) -> None:
-        before = get_memory_info().free_bytes
+        before = livemem.system_memory().used
         try:
-            subprocess.run(
-                ["osascript", "-e", 'do shell script "/usr/sbin/purge" with administrator privileges'],
-                check=True, capture_output=True, text=True, timeout=180,
-            )
-        except subprocess.CalledProcessError:
-            rumps.notification("Macpurge", "Could not free RAM", "Password cancelled or purge failed.")
-            return
+            ok, err = privileged.run_purge()
         except Exception as exc:
             rumps.notification("Macpurge", "Error", str(exc)[:120])
             return
-        freed = max(get_memory_info().free_bytes - before, 0)
-        rumps.notification("Macpurge", "RAM freed", f"~{format_size(freed)} reclaimed.")
-        self._on_main(self._tick, None)
+        if not ok:
+            rumps.notification("Macpurge", "Could not free RAM", err or "purge failed.")
+            return
+        freed = max(before - livemem.system_memory().used, 0)
+        rumps.notification("Macpurge", "File cache cleared",
+                           f"~{format_size(freed)} freed. Memory apps hold is not affected.")
+        self.refresh_soon()
+
+    def toggle_passwordless(self, _) -> None:
+        if privileged.passwordless_enabled():
+            if not _confirm("Ask for the password again?",
+                            "Free RAM will ask for your password again. "
+                            "macOS asks for it once now to remove the setting."):
+                return
+            ok, err = privileged.disable_passwordless()
+        else:
+            if not _confirm(
+                "Free RAM without password?",
+                "Lets Macpurge run macOS's `purge` command (it frees inactive "
+                "memory) without asking for your password. It allows only this "
+                "one command, nothing else.\n\n"
+                "macOS asks for your password once now to set this up.",
+            ):
+                return
+            ok, err = privileged.enable_passwordless()
+        if not ok:
+            rumps.notification("Macpurge", "Setting not changed", err or "Unknown error.")
+        self.nopass_item.state = privileged.passwordless_enabled()
 
     # ------------------------------------------------------------------ scan
 
@@ -436,11 +545,11 @@ class MacpurgeApp(rumps.App):
     def _show_unused(self, apps) -> None:
         items = [
             rumps.MenuItem(f"{a.name}  ·  {format_size(a.size)}  ·  {a.days_unused} days",
-                           callback=lambda _, a=a: self._remove_app(a))
+                           callback=lambda _, a=a: self.open_uninstaller([a.path]))
             for a in apps
         ]
         if items:
-            items += [None, _placeholder("Click to move an app to the Trash")]
+            items += [None, _placeholder("Click to uninstall (opens the app list)")]
         self._fill(self.unused_menu, items or [_placeholder("No unused apps found")])
 
     # ------------------------------------------------------------------ clean
@@ -480,37 +589,34 @@ class MacpurgeApp(rumps.App):
             rumps.notification("Macpurge", "Cleanup complete", f"Freed {freed}.")
             self._scan_results = scan_all(progress=False)
             self._on_main(self._show_reclaimable, self._scan_results)
-            self._on_main(self._tick, None)
+            self.refresh_soon()
         finally:
-            # Queued after the tick, so the tick marks our own log as seen
-            # before this flag flips back (no "automatic cleanup" notice).
-            self._on_main(setattr, self, "_own_clean", False)
+            self._on_main(self._own_clean_done)
+
+    def _own_clean_done(self) -> None:
+        # Our own log counts as seen, so no "automatic cleanup done" notice.
+        self._seen_log = self._newest_clean_log()
+        self._own_clean = False
 
     # ------------------------------------------------------------------ apps
 
-    def _remove_app(self, app: insights.UnusedApp) -> None:
-        leftovers = insights.app_leftovers(app)
-        listed = "\n".join(f"• {shorten_path(p)}" for p in leftovers[:8])
-        more = f"\n• …and {len(leftovers) - 8} more" if len(leftovers) > 8 else ""
-        if not _confirm(
-            f"Move {app.name} to the Trash?",
-            f"Not used for {app.days_unused} days, takes {format_size(app.size)}.\n\n"
-            f"Also moves its leftover files:\n{listed or '• none found'}{more}\n\n"
-            "Everything goes to the Trash, so you can put it back until you empty it. "
-            "Finder may ask for your password.",
-        ):
+    def open_uninstaller(self, preselect=None) -> None:
+        """Open the 'Uninstall apps' window (or bring it to the front)."""
+        from .uninstall_window import UninstallWindow   # AppKit-heavy, load lazily
+        w = self._uninstall_window
+        if w is not None and w.window.isVisible():
+            w.show()
             return
+        self._uninstall_window = UninstallWindow.alloc().init().setup(
+            [str(p) for p in preselect or []], self._uninstaller_closed)
+        self._uninstall_window.show()
 
-        def run():
-            moved, errors = insights.trash_paths([app.path, *leftovers])
-            if errors:
-                rumps.notification("Macpurge", f"{app.name}: some items stayed", errors[0][:120])
-            else:
-                rumps.notification("Macpurge", f"{app.name} moved to the Trash",
-                                   f"{format_size(moved)} will be freed when you empty the Trash.")
-            self._on_main(self._show_unused, insights.unused_apps())
-
-        self._background("Remove app", run)
+    def _uninstaller_closed(self, deleted_something: bool) -> None:
+        self._uninstall_window = None
+        if deleted_something:
+            self.refresh_soon()
+            if not self._busy.locked():
+                self._background("Scan", lambda: self._do_scan(notify=False))
 
     # ------------------------------------------------------------------ settings
 
@@ -572,6 +678,33 @@ class MacpurgeApp(rumps.App):
         sched = f"Automatic cleanup: {interval}" if interval else "Automatic cleanup: off"
         rumps.alert(title=f"Macpurge {__version__}",
                     message=f"{sched}\n\nRecent cleanups:\n{lines}", ok="Close")
+
+
+class _ActivationObserver(NSObject):
+    """Records when apps come to the front or leave it (for idle apps)."""
+
+    @objc.python_method
+    def setup(self, activity: "livemem.ActivityLog"):
+        self.activity = activity
+        ws = NSWorkspace.sharedWorkspace()
+        nc = ws.notificationCenter()
+        for name in ("NSWorkspaceDidActivateApplicationNotification",
+                     "NSWorkspaceDidDeactivateApplicationNotification"):
+            nc.addObserver_selector_name_object_(self, "appChanged:", name, None)
+        front = ws.frontmostApplication()
+        if front is not None and front.bundleURL() is not None:
+            activity.activated(str(front.bundleURL().path()))
+        return self
+
+    def appChanged_(self, note):
+        app = note.userInfo().get("NSWorkspaceApplicationKey")
+        if app is not None and app.bundleURL() is not None:
+            self.activity.activated(str(app.bundleURL().path()))
+
+
+def _hours(seconds: float) -> str:
+    h = int(seconds // 3600)
+    return f"{h} h" if h < 48 else f"{h // 24} days"
 
 
 def _short_name(path: Path, limit: int = 48) -> str:

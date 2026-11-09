@@ -35,8 +35,8 @@ OPTIONS = {
         "CFBundleName": "Macpurge",
         "CFBundleDisplayName": "Macpurge",
         "CFBundleIdentifier": "com.sohrab.macpurge",
-        "CFBundleVersion": "0.2.0",
-        "CFBundleShortVersionString": "0.2.0",
+        "CFBundleVersion": "0.4.0",
+        "CFBundleShortVersionString": "0.4.0",
         "LSUIElement": True,               # menu-bar-only, no Dock icon
         "LSMinimumSystemVersion": "11.0",
         "NSHumanReadableCopyright": "MIT licensed",

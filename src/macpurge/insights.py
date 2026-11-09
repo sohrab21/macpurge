@@ -1,13 +1,12 @@
 """Read-only system insights for the menu bar app.
 
 Everything here is GUI-free and safe to run on a background thread:
-memory pressure, per-app memory, disk space, large/old files, unused apps
-and cleanup history. The only write operation is `trash_paths`, which moves
-items to the macOS Trash via Finder (recoverable), never deletes.
+disk space, large/old files, unused and installed apps and cleanup
+history. Live memory readings are in `livemem.py`. Nothing here deletes;
+app removal lives in `app_removal.py`.
 """
 
 import os
-import pwd
 import re
 import shutil
 import subprocess
@@ -16,100 +15,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from .logger import AuditLogger, LOG_DIR
+from .logger import LOG_DIR
 from .paths import SKIP_DIR_NAMES
 from .scanner import scan_big_files, scan_stale_files
 from .uninstaller import _read_bundle_id
 from .utils import dir_size
 
 HOME = Path.home()
-
-# --- memory -----------------------------------------------------------------
-
-PRESSURE_NORMAL, PRESSURE_WARN, PRESSURE_CRITICAL = "normal", "warn", "critical"
-
-
-def memory_pressure() -> str:
-    """macOS's own memory pressure level (the Activity Monitor graph colour)."""
-    try:
-        level = int(subprocess.check_output(
-            ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"], text=True
-        ).strip())
-    except (subprocess.CalledProcessError, OSError, ValueError):
-        return PRESSURE_NORMAL
-    if level >= 4:
-        return PRESSURE_CRITICAL
-    if level >= 2:
-        return PRESSURE_WARN
-    return PRESSURE_NORMAL
-
-
-@dataclass
-class AppMemory:
-    name: str            # "Google Chrome" or a process name like "python3.13"
-    rss_bytes: int
-    pids: list[int]
-    is_app: bool         # True = lives in a .app bundle → quit via AppleScript
-
-
-_APP_RE = re.compile(r"/([^/]+)\.app/")
-
-
-def top_apps_by_memory(n: int = 5) -> list[AppMemory]:
-    """Current user's memory use grouped by app (Chrome + helpers = one row)."""
-    user = pwd.getpwuid(os.getuid()).pw_name
-    try:
-        out = subprocess.check_output(
-            ["ps", "-U", user, "-o", "pid=,rss=,comm="],
-            text=True, stderr=subprocess.DEVNULL,
-        )
-    except (subprocess.CalledProcessError, OSError):
-        return []
-
-    groups: dict[str, AppMemory] = {}
-    own_pid = os.getpid()
-    for line in out.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) < 3:
-            continue
-        try:
-            pid, rss_kb = int(parts[0]), int(parts[1])
-        except ValueError:
-            continue
-        comm = parts[2].strip()
-        if pid == own_pid or comm.startswith(("/System/", "/usr/libexec/", "/usr/sbin/")):
-            continue
-        m = _APP_RE.search(comm)          # first .app = the outer app bundle
-        name, is_app = (m.group(1), True) if m else (os.path.basename(comm), False)
-        if name in ("Finder", "Dock", "SystemUIServer", "Macpurge", "loginwindow"):
-            continue
-        g = groups.setdefault(name, AppMemory(name, 0, [], is_app))
-        g.rss_bytes += rss_kb * 1024
-        g.pids.append(pid)
-
-    # Only real apps: command-line processes (shells, Claude Code, servers)
-    # shouldn't be one click away from being quit.
-    apps = [g for g in groups.values() if g.is_app]
-    return sorted(apps, key=lambda g: g.rss_bytes, reverse=True)[:n]
-
-
-def quit_app(entry: AppMemory) -> bool:
-    """Ask an app to quit (it can save work / ask about unsaved changes)."""
-    if entry.is_app:
-        r = subprocess.run(
-            ["osascript", "-e", f'tell application "{entry.name}" to quit'],
-            capture_output=True, timeout=30,
-        )
-        return r.returncode == 0
-    ok = False
-    for pid in entry.pids:
-        try:
-            os.kill(pid, 15)  # SIGTERM: polite, lets the process clean up
-            ok = True
-        except OSError:
-            pass
-    return ok
-
 
 # --- permissions ------------------------------------------------------------
 
@@ -233,7 +145,7 @@ def _newest_mtime(path: Path, newer_than: float, budget: int = 20_000) -> float:
 def _team_id(app: Path) -> str | None:
     try:
         r = subprocess.run(["codesign", "-dv", str(app)], capture_output=True,
-                           text=True, timeout=10)
+                           encoding="utf-8", errors="replace", timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return None
     m = re.search(r"^TeamIdentifier=(\w+)", r.stderr, re.M)
@@ -246,7 +158,7 @@ def _spotlight_last_used(app: Path) -> float:
     try:
         out = subprocess.check_output(
             ["mdls", "-raw", "-name", "kMDItemLastUsedDate", str(app)],
-            text=True, stderr=subprocess.DEVNULL, timeout=10,
+            encoding="utf-8", errors="replace", stderr=subprocess.DEVNULL, timeout=10,
         ).strip()
         return datetime.strptime(out[:19], "%Y-%m-%d %H:%M:%S").timestamp()
     except Exception:
@@ -280,10 +192,30 @@ def _extra_activity(app: Path, bid: str, cutoff: float) -> float:
 
 def _running_app_paths() -> set[str]:
     try:
-        out = subprocess.check_output(["ps", "-axo", "comm="], text=True)
+        out = subprocess.check_output(["ps", "-axo", "comm="], encoding="utf-8", errors="replace")
     except (subprocess.CalledProcessError, OSError):
         return set()
     return {m.group(0).rstrip("/") for m in re.finditer(r"^/.*?\.app/", out, re.M)}
+
+
+def _last_activity(app: Path, bid: str, cutoff: float) -> tuple[float, bool]:
+    """(newest activity timestamp, has data folders). Stops early once
+    anything is newer than `cutoff`. Second-opinion signals (extension and
+    group containers, Spotlight) are only checked when the app looks unused
+    by its own data folders."""
+    newest, has_data = 0.0, False
+    for base, pattern in _DATA_DIRS:
+        p = HOME / base / pattern.format(name=app.stem, bid=bid)
+        if p.exists():
+            has_data = True
+            newest = max(newest, _newest_mtime(p, cutoff))
+            if newest > cutoff:
+                return newest, has_data
+    return max(newest, _extra_activity(app, bid, cutoff)), has_data
+
+
+def _is_running(app: Path, running: set[str]) -> bool:
+    return any(p == str(app) or p.startswith(str(app) + "/") for p in running)
 
 
 def unused_apps(min_days: int = 60, n: int = 10) -> list[UnusedApp]:
@@ -306,68 +238,134 @@ def unused_apps(min_days: int = 60, n: int = 10) -> list[UnusedApp]:
             bid = _read_bundle_id(entry) or ""
             if not bid or bid.startswith("com.apple.") or entry.name == "Macpurge.app":
                 continue
-            if any(p == str(entry) or p.startswith(str(entry) + "/") for p in running):
+            if _is_running(entry, running):
                 continue
-            name = entry.stem
-            newest = 0.0
-            has_data = False
-            for base, pattern in _DATA_DIRS:
-                p = HOME / base / pattern.format(name=name, bid=bid)
-                if p.exists():
-                    has_data = True
-                    newest = max(newest, _newest_mtime(p, cutoff))
-                    if newest > cutoff:
-                        break
+            newest, has_data = _last_activity(entry, bid, cutoff)
             if not has_data or newest > cutoff:
                 continue
-            newest = max(newest, _extra_activity(entry, bid, cutoff))
-            if newest > cutoff:
-                continue
             days = int((time.time() - newest) / 86400)
-            found.append(UnusedApp(name, entry, bid, days, dir_size(entry)))
+            found.append(UnusedApp(entry.stem, entry, bid, days, dir_size(entry)))
     found.sort(key=lambda a: a.size, reverse=True)
     return found[:n]
 
 
-def app_leftovers(app: UnusedApp) -> list[Path]:
-    """User-level leftovers that belong to this app. Matches the bundle ID,
-    or the exact app name — never a substring, so "Go" can't hit "Google"."""
+# --- all apps (remove any app, used or not) ----------------------------------
+
+@dataclass
+class InstalledApp:
+    name: str
+    path: Path
+    bundle_id: str
+    size: int                 # app bundle only
+    running: bool
+    last_used: float          # timestamp; 0 = unknown
+    leftovers: list[Path]
+    leftover_size: int
+
+    @property
+    def total_size(self) -> int:
+        return self.size + self.leftover_size
+
+
+# Apple apps that ship with macOS can't be removed (sealed system volume),
+# but Apple apps from the App Store (iMovie, Keynote, …) can.
+def _removable(app: Path, bid: str) -> bool:
+    if app.name == "Macpurge.app" or app.is_symlink():
+        return False
+    if bid.startswith("com.apple."):
+        return (app / "Contents/_MASReceipt").exists()
+    return True
+
+
+APP_ROOTS = (Path("/Applications"), HOME / "Applications")
+
+
+def _app_bundles() -> list[Path]:
+    """.app bundles in /Applications and ~/Applications, plus one folder
+    level down (vendors like Adobe put apps in their own folder)."""
+    found = []
+    for root in APP_ROOTS:
+        try:
+            entries = sorted(root.iterdir())
+        except OSError:
+            continue
+        for e in entries:
+            if e.suffix == ".app":
+                found.append(e)
+            elif e.is_dir() and not e.is_symlink() and e.name != "Utilities":
+                try:
+                    found += sorted(c for c in e.iterdir() if c.suffix == ".app")
+                except OSError:
+                    pass
+    return found
+
+
+def _path_size(p: Path) -> int:
+    try:
+        if p.is_symlink() or p.is_file():
+            st = p.lstat()
+            return st.st_blocks * 512
+    except OSError:
+        return 0
+    return dir_size(p)
+
+
+def installed_apps() -> list[InstalledApp]:
+    """Every app the user can remove, whether used or not, alphabetical."""
+    running = _running_app_paths()
+    now = time.time()
+    apps = []
+    for entry in _app_bundles():
+        bid = _read_bundle_id(entry) or ""
+        if not _removable(entry, bid):
+            continue
+        is_running = _is_running(entry, running)
+        last = now if is_running else _last_activity(entry, bid, now - 86400)[0]
+        app = InstalledApp(entry.stem, entry, bid, dir_size(entry), is_running, last, [], 0)
+        app.leftovers = app_leftovers(app)
+        app.leftover_size = sum(_path_size(p) for p in app.leftovers)
+        apps.append(app)
+    apps.sort(key=lambda a: a.name.lower())
+    return apps
+
+
+def quit_app_and_wait(name: str, path: Path, timeout: float = 15) -> bool:
+    """Politely quit an app (it may ask to save), then wait until it's gone."""
+    try:
+        subprocess.run(["osascript", "-e", f'tell application "{name}" to quit'],
+                       capture_output=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        pass
+    end = time.time() + timeout
+    while time.time() < end:
+        if not _is_running(path, _running_app_paths()):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+LEFTOVER_BASES = ("Library/Application Support", "Library/Preferences", "Library/Caches",
+                  "Library/Containers", "Library/Saved Application State",
+                  "Library/HTTPStorages", "Library/WebKit", "Library/LaunchAgents")
+
+
+def app_leftovers(app) -> list[Path]:
+    """User-level leftovers that belong to this app (anything with `.name`
+    and `.bundle_id`). Matches the exact bundle ID, the bundle ID plus a
+    dot-suffix (extensions, .plist, .savedState) or the exact app name,
+    never a substring, so "Go" can't hit "Google"."""
     bid, name = app.bundle_id.lower(), app.name.lower()
     hits = []
-    for base in ("Library/Application Support", "Library/Preferences", "Library/Caches",
-                 "Library/Containers", "Library/Saved Application State",
-                 "Library/HTTPStorages", "Library/WebKit", "Library/LaunchAgents"):
+    for base in LEFTOVER_BASES:
         d = HOME / base
         try:
             for e in d.iterdir():
                 low = e.name.lower()
-                if low == name or low.startswith(bid) or low == bid + ".plist":
+                if low == name or (bid and (low == bid or low.startswith(bid + "."))):
                     hits.append(e)
         except OSError:
             continue
     return hits
-
-
-def trash_paths(paths: list[Path], operation: str = "uninstall") -> tuple[int, list[str]]:
-    """Move paths to the Trash via Finder (recoverable). Logs each one.
-    Returns (bytes moved, error messages)."""
-    moved, errors = 0, []
-    with AuditLogger(operation=operation) as logger:
-        for p in paths:
-            size = dir_size(p) if p.is_dir() else p.stat().st_size if p.exists() else 0
-            posix = str(p).replace("\\", "\\\\").replace('"', '\\"')
-            r = subprocess.run(
-                ["osascript", "-e",
-                 f'tell application "Finder" to delete (POSIX file "{posix}" as alias)'],
-                capture_output=True, text=True, timeout=120,
-            )
-            if r.returncode == 0:
-                logger.log_deletion(p, size)
-                moved += size
-            else:
-                logger.log_skipped(p, r.stderr.strip()[:100] or "Finder refused")
-                errors.append(f"{p.name}: {r.stderr.strip()[:80]}")
-    return moved, errors
 
 
 # --- cleanup history --------------------------------------------------------

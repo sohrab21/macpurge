@@ -18,7 +18,10 @@ mkdir -p "$STAGE"
 rsync -a --delete --exclude .venv --exclude build --exclude dist --exclude .git \
   --exclude dist-share "$PROJ/" "$STAGE/"
 cd "$STAGE"
-if [[ ! -x .venv/bin/python ]]; then
+# macOS prunes old files in /tmp, which can leave a half-deleted venv
+# (bin/python symlink but no pyvenv.cfg/pip → "externally-managed-environment").
+if [[ ! -f .venv/pyvenv.cfg || ! -x .venv/bin/pip ]]; then
+  rm -rf .venv
   /opt/homebrew/bin/python3.13 -m venv .venv
 fi
 .venv/bin/python -m pip install -q -e ".[gui,build]"

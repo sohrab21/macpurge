@@ -178,7 +178,7 @@ def _is_app_running(app_name: str) -> tuple[bool, list[int]]:
     try:
         result = subprocess.run(
             ["pgrep", "-fi", app_name],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, encoding="utf-8", errors="replace", timeout=5,
         )
         if result.returncode == 0:
             pids = [int(p) for p in result.stdout.strip().splitlines() if p.strip()]

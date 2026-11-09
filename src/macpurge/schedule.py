@@ -53,7 +53,7 @@ def setup_schedule(interval: str = "weekly") -> None:
 
     result = subprocess.run(
         ["launchctl", "load", str(PLIST_PATH)],
-        capture_output=True, text=True,
+        capture_output=True, encoding="utf-8", errors="replace",
     )
 
     if result.returncode != 0:
@@ -116,7 +116,7 @@ def show_status() -> None:
 
     result = subprocess.run(
         ["launchctl", "list", LABEL],
-        capture_output=True, text=True,
+        capture_output=True, encoding="utf-8", errors="replace",
     )
 
     if result.returncode == 0:
